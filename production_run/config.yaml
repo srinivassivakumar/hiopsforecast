@@ -1,0 +1,61 @@
+project:
+  timezone: UTC
+  frequency_minutes: 1
+
+input:
+  # Keep empty in production API mode.
+  unified_history_csv: ""
+
+api:
+  enabled: true
+  secret_key: "A0tziuB02IrdIS"
+  ips:
+    - "10.192.1.71"
+
+  # If true, extract both disk IOPS and network metrics from vm-performance only.
+  vm_unified_enabled: true
+  vm_base_url: "https://dev-admin-console.zybisys.com/api/admin-api/vm-performance"
+  vm_request_style: "query_milliseconds"
+  vm_unified_response:
+    message_key: "performance_metrics"
+    time_key: "disk_io_summary.io_operations_data.time_str"
+    read_key: "disk_io_summary.io_operations_data.read_data"
+    write_key: "disk_io_summary.io_operations_data.write_data"
+    interface_key: "interface"
+    interface_in_key: "in_bandwidth"
+    interface_out_key: "out_bandwidth"
+    ip_key: "ip"
+    payload_ip_key: "lan_ip"
+
+  iops_base_url: "https://dev-admin-console.zybisys.com/api/admin-api/disk-iops"
+  iops_request_style: "path_milliseconds"
+  iops_response:
+    message_key: "message"
+    time_key: "time_str"
+    read_key: "read_data"
+    write_key: "write_data"
+    ip_key: "ip"
+
+  network_base_url: "https://staging-admin-console.zybisys.com/api/admin-api/vm-performance"
+  network_request_style: "query_milliseconds"
+  network_response:
+    message_key: "message"
+    time_key: "time_str"
+    in_key: "in_data"
+    out_key: "out_data"
+    single_key: "tcp_connection.established"
+    ip_key: "ip"
+
+  timeout_seconds: 20
+
+lookback:
+  history_hours: 240
+
+forecast:
+  short_horizon_steps: 60
+  long_horizon_steps: 168
+  test_fraction: 0.2
+  max_lag_steps: 24
+
+output:
+  base_dir: "outputs"

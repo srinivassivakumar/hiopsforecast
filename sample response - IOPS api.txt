@@ -1,0 +1,95 @@
+{
+    "message": [
+        {
+            "time": "11:25 am",
+            "time_str": 1776059705,
+            "read_data": 0.883333,
+            "write_data": 54.583333
+        },
+        {
+            "time": "11:26 am",
+            "time_str": 1776059765,
+            "read_data": 0.55,
+            "write_data": 54.633333
+        },
+        {
+            "time": "11:27 am",
+            "time_str": 1776059825,
+            "read_data": 1.283333,
+            "write_data": 56.2
+        },
+        {
+            "time": "11:28 am",
+            "time_str": 1776059885,
+            "read_data": 2.716667,
+            "write_data": 59.816667
+        },
+        {
+            "time": "11:29 am",
+            "time_str": 1776059945,
+            "read_data": 1.016667,
+            "write_data": 55.25
+        },
+        {
+            "time": "11:30 am",
+            "time_str": 1776060010,
+            "read_data": 0.05,
+            "write_data": 56.216667
+        },
+        {
+            "time": "11:31 am",
+            "time_str": 1776060065,
+            "read_data": 2.213115,
+            "write_data": 53.42623
+        },
+        {
+            "time": "11:32 am",
+            "time_str": 1776060125,
+            "read_data": 33.516667,
+            "write_data": 65.35
+        },
+        {
+            "time": "11:33 am",
+            "time_str": 1776060186,
+            "read_data": 1.372881,
+            "write_data": 74.745763
+        },
+        {
+            "time": "11:34 am",
+            "time_str": 1776060245,
+            "read_data": 1.066667,
+            "write_data": 61.45
+        },
+        {
+            "time": "11:35 am",
+            "time_str": 1776060306,
+            "read_data": 2.216667,
+            "write_data": 56.916667
+        },
+        {
+            "time": "11:36 am",
+            "time_str": 1776060366,
+            "read_data": 1.366667,
+            "write_data": 57.45
+        },
+        {
+            "time": "11:37 am",
+            "time_str": 1776060425,
+            "read_data": 105.05,
+            "write_data": 272.25
+        },
+        {
+            "time": "11:38 am",
+            "time_str": 1776060485,
+            "read_data": 7.816667,
+            "write_data": 61.033333
+        },
+        {
+            "time": "11:39 am",
+            "time_str": 1776060545,
+            "read_data": 265.15,
+            "write_data": 96.516667
+        }
+    ],
+    "ip": "10.192.1.71"
+}
