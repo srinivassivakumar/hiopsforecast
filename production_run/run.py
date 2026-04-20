@@ -119,8 +119,9 @@ for item in metrics:
 
     in_bw = out_bw = 0.0
     for itf in (item.get("interface") or []):
-        in_bw  += to_float(itf.get("in_bandwidth",  0.0))
-        out_bw += to_float(itf.get("out_bandwidth", 0.0))
+        # API returns bytes/s → convert to Mbps (÷ 125,000)
+        in_bw  += to_float(itf.get("in_bandwidth",  0.0)) / 125_000
+        out_bw += to_float(itf.get("out_bandwidth", 0.0)) / 125_000
 
     rows.append({
         "timestamp":     ts,

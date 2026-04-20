@@ -113,8 +113,9 @@ def fetch_one_ip(ip: str, from_ms: int, to_ms: int) -> pd.DataFrame:
         write_iops = to_float(dig(item, "disk_io_summary.io_operations_data.write_data", 0.0))
         in_bw = out_bw = 0.0
         for itf in (item.get("interface") or []):
-            in_bw  += to_float(itf.get("in_bandwidth",  0.0))
-            out_bw += to_float(itf.get("out_bandwidth", 0.0))
+            # API returns bytes/s → convert to Mbps (÷ 125,000)
+            in_bw  += to_float(itf.get("in_bandwidth",  0.0)) / 125_000
+            out_bw += to_float(itf.get("out_bandwidth", 0.0)) / 125_000
         rows.append({
             "ip":            ip,
             "timestamp":     ts,
