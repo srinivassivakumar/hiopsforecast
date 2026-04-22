@@ -42,21 +42,31 @@ def ask(prompt: str, default: str) -> str:
 
 print("\n=== Network -> IOPS Forecasting ===")
 print("Direct-horizon per scope (INDIVIDUAL + OVERALL).\n")
+print("Select training mode:")
+print("  1  Day-based  — train on a date range, forecast a full day")
+print("  2  Hour-based — train on a time range, forecast N hours ahead")
+MODE = ask("Mode (1 or 2)", "1").strip()
 
 raw_ips = ask("Enter VM IP address(es), comma-separated", "10.192.1.71")
 ip_list = [ip.strip() for ip in raw_ips.split(",") if ip.strip()]
 
-print("\nDate range for training data (YYYY-MM-DD, treated as IST midnight):")
-start_str = ask("Start date", (datetime.now(IST) - timedelta(days=2)).strftime("%Y-%m-%d"))
-end_str = ask("End date  ", datetime.now(IST).strftime("%Y-%m-%d"))
-
-show_actual_min = int(ask("\nMinutes of actual data to show on chart", "15"))
-show_forecast_min = int(ask("Minutes of forecast to generate & show  ", "15"))
-
-iops_smoothing_on = ask("Enable IOPS smoothing on chart (y/n)", "n").strip().lower() in {"y", "yes"}
+iops_smoothing_on = False
 iops_smooth_window = 1
-if iops_smoothing_on:
-    iops_smooth_window = max(1, int(ask("IOPS smoothing window (minutes)", "3")))
+
+if MODE == "1":
+    print("\nFormat: YYYY-MM-DD")
+    train_start_str = ask("Train from (date)", (datetime.now(IST) - timedelta(days=8)).strftime("%Y-%m-%d"))
+    train_end_str = ask("Train to   (date)", (datetime.now(IST) - timedelta(days=1)).strftime("%Y-%m-%d"))
+    forecast_date_str = ask("Forecast for (date)", datetime.now(IST).strftime("%Y-%m-%d"))
+    show_actual_min = 60
+    show_forecast_min = 1440
+else:
+    print("\nFormat: YYYY-MM-DD HH:MM")
+    train_start_str = ask("Train from", (datetime.now(IST) - timedelta(hours=4)).strftime("%Y-%m-%d %H:%M"))
+    train_end_str = ask("Train to  ", (datetime.now(IST) - timedelta(hours=1)).strftime("%Y-%m-%d %H:%M"))
+    forecast_hours = float(ask("Forecast duration (hours)", "1"))
+    show_forecast_min = max(1, int(forecast_hours * 60))
+    show_actual_min = int(ask("Minutes of actual history to show on chart", "60"))
 
 
 # ------------------------------------------------------------------
@@ -67,8 +77,12 @@ def date_to_ms(date_str: str, end_of_day: bool = False) -> int:
     if end_of_day:
         dt = dt.replace(hour=23, minute=59, second=59)
     dt_ist = dt.replace(tzinfo=IST)
-    dt_utc = dt_ist.astimezone(timezone.utc)
-    return int(dt_utc.timestamp() * 1000)
+    return int(dt_ist.astimezone(timezone.utc).timestamp() * 1000)
+
+
+def datetime_to_ms(dt_str: str) -> int:
+    dt = datetime.strptime(dt_str.strip(), "%Y-%m-%d %H:%M")
+    return int(dt.replace(tzinfo=IST).astimezone(timezone.utc).timestamp() * 1000)
 
 
 def to_float(v, default=0.0):
@@ -86,13 +100,24 @@ def dig(obj, path: str, default=None):
     return obj
 
 
-def fetch_one_ip(ip: str, from_ms: int, to_ms: int, timeout: int = 60) -> pd.DataFrame:
+def _fetch_chunk(ip: str, from_ms: int, to_ms: int, timeout: int = 90) -> list:
     req_url = f"{API_BASE}/{ip}?from={from_ms}&to={to_ms}"
     resp = requests.get(req_url, headers={"X-SECRET-KEY": SECRET_KEY}, timeout=timeout)
+    if resp.status_code == 404:
+        return []
     resp.raise_for_status()
     payload = resp.json()
+    return payload.get("performance_metrics", [])
 
-    metrics = payload.get("performance_metrics", [])
+
+def fetch_one_ip(ip: str, from_ms: int, to_ms: int, timeout: int = 180) -> pd.DataFrame:
+    chunk_ms = 7 * 24 * 3600 * 1000
+    metrics: list = []
+    cursor = from_ms
+    while cursor < to_ms:
+        end = min(cursor + chunk_ms, to_ms)
+        metrics.extend(_fetch_chunk(ip, cursor, end, timeout=90))
+        cursor = end + 1
     rows = []
     for item in metrics:
         ts_raw = dig(item, "disk_io_summary.io_operations_data.time_str", None)
@@ -135,8 +160,12 @@ def fetch_one_ip(ip: str, from_ms: int, to_ms: int, timeout: int = 60) -> pd.Dat
     return pd.DataFrame(rows).sort_values("timestamp").reset_index(drop=True)
 
 
-from_ms = date_to_ms(start_str, end_of_day=False)
-to_ms = date_to_ms(end_str, end_of_day=True)
+if MODE == "1":
+    from_ms = date_to_ms(train_start_str, end_of_day=False)
+    to_ms = date_to_ms(forecast_date_str, end_of_day=True)
+else:
+    from_ms = datetime_to_ms(train_start_str)
+    to_ms = datetime_to_ms(train_end_str) + show_forecast_min * 60 * 1000
 
 print(f"\nFetching data for {len(ip_list)} IP(s)...")
 frames = []
@@ -213,6 +242,40 @@ for c in ["cpu_percent", "ram_percent", "cpu_load_total", "cpu_load_1", "cpu_loa
 # ------------------------------------------------------------------
 # FEATURE ENGINEERING
 # ------------------------------------------------------------------
+def infer_freq_minutes(ts: pd.Series) -> int:
+    diffs = ts.sort_values().diff().dropna()
+    if diffs.empty:
+        return 1
+    median_diff = diffs.median()
+    freq = int(median_diff.total_seconds() / 60)
+    return max(1, freq)
+
+
+def make_seasonal_lags(n_rows: int, freq_minutes: int) -> list[int]:
+    lags = set()
+    for x in [1, 2, 3, 5, 10, 15]:
+        if x < n_rows:
+            lags.add(x)
+    for x in [30, 60, 120, 240]:
+        if x < n_rows:
+            lags.add(x)
+    day_lag = int((24 * 60) / freq_minutes)
+    if day_lag < n_rows:
+        lags.add(day_lag)
+    week_lag = int((7 * 24 * 60) / freq_minutes)
+    if week_lag < n_rows:
+        lags.add(week_lag)
+    month_lag = int((30 * 24 * 60) / freq_minutes)
+    if month_lag < n_rows:
+        lags.add(month_lag)
+
+    if n_rows < 500:
+        max_allowed = max(12, n_rows // 4)
+        lags = {x for x in lags if x <= max_allowed}
+
+    return sorted(lags)
+
+
 def time_features(ts: pd.Series) -> pd.DataFrame:
     minute_of_day = ts.dt.hour * 60 + ts.dt.minute
     return pd.DataFrame({
@@ -227,12 +290,10 @@ def time_features(ts: pd.Series) -> pd.DataFrame:
     }, index=ts.index)
 
 
-def lag_features(series: pd.Series, name: str, max_lag_allowed: int = 1440) -> pd.DataFrame:
+def lag_features(series: pd.Series, name: str, lags: list[int]) -> pd.DataFrame:
     out = {}
-    lags = [l for l in LAGS_BASE if l <= max_lag_allowed]
     for lag in lags:
         out[f"{name}_lag_{lag}"] = series.shift(lag)
-
     past = series.shift(1)
     ewma15 = past.ewm(span=15, adjust=False).mean()
     ewma60 = past.ewm(span=60, adjust=False).mean()
@@ -252,11 +313,13 @@ def lag_features(series: pd.Series, name: str, max_lag_allowed: int = 1440) -> p
     return pd.DataFrame(out, index=series.index)
 
 
-def build_design_matrix(df: pd.DataFrame, target: str, exogenous_cols: list[str], max_lag: int = 1440) -> pd.DataFrame:
+def build_design_matrix(df: pd.DataFrame, target: str, exogenous_cols: list[str]) -> pd.DataFrame:
+    freq_minutes = infer_freq_minutes(df["timestamp"])
+    lags = make_seasonal_lags(len(df), freq_minutes)
     tf = time_features(df["timestamp"])
-    feats = [tf, lag_features(df[target], target, max_lag_allowed=max_lag)]
+    feats = [tf, lag_features(df[target], target, lags)]
     for col in exogenous_cols:
-        feats.append(lag_features(df[col], col, max_lag_allowed=max_lag))
+        feats.append(lag_features(df[col], col, lags))
     x = pd.concat(feats, axis=1)
     x.insert(0, "timestamp", df["timestamp"])
     return x
@@ -267,41 +330,36 @@ def build_design_matrix(df: pd.DataFrame, target: str, exogenous_cols: list[str]
 # ------------------------------------------------------------------
 try:
     from lightgbm import LGBMRegressor
-
-    def make_model():
-        return LGBMRegressor(
-            n_estimators=1200,
-            learning_rate=0.03,
-            num_leaves=63,
-            min_child_samples=25,
-            subsample=0.85,
-            colsample_bytree=0.85,
-            reg_alpha=0.05,
-            reg_lambda=0.05,
-            random_state=42,
-            n_jobs=-1,
-            verbose=-1,
-        )
-
-    print("\nUsing LightGBM")
-except Exception:
-    from sklearn.ensemble import RandomForestRegressor
-
-    def make_model():
-        return RandomForestRegressor(n_estimators=500, max_depth=14, random_state=42, n_jobs=-1)
-
-    print("\nUsing RandomForest (LightGBM not installed)")
+except ImportError as exc:
+    raise SystemExit("LightGBM is required but not installed. Run: pip install lightgbm") from exc
 
 
-def train_direct_models(
+def make_model():
+    return LGBMRegressor(
+        n_estimators=400,
+        learning_rate=0.03,
+        num_leaves=63,
+        min_child_samples=25,
+        subsample=0.85,
+        colsample_bytree=0.85,
+        reg_alpha=0.05,
+        reg_lambda=0.05,
+        random_state=42,
+        n_jobs=-1,
+        verbose=-1,
+    )
+
+
+print("\nUsing LightGBM")
+
+
+def train_single_model(
     df_train: pd.DataFrame,
     target: str,
     exogenous_cols: list[str],
-    horizons: list[int],
-) -> tuple[dict[int, object], list[str], pd.Series]:
+) -> tuple[Optional[object], list[str], pd.Series, float]:
     exog = [c for c in exogenous_cols if c != target]
-    max_lag = min(1440, max(24, len(df_train) // 3))
-    x_frame = build_design_matrix(df_train, target, exog, max_lag=max_lag)
+    x_frame = build_design_matrix(df_train, target, exog)
     feature_cols = [c for c in x_frame.columns if c != "timestamp"]
     x_all = x_frame[feature_cols]
 
@@ -311,21 +369,24 @@ def train_direct_models(
 
     feat_lo = x_all.quantile(0.02)
     feat_hi = x_all.quantile(0.98)
-    x_latest_raw = x_all.iloc[[-1]].copy()
-    x_latest = x_latest_raw.clip(lower=feat_lo, upper=feat_hi, axis=1)
+    x_latest = x_all.iloc[[-1]].copy().clip(lower=feat_lo, upper=feat_hi, axis=1)
 
-    models: dict[int, object] = {}
-    for h in horizons:
-        y_log = np.log1p(df_train[target].shift(-h))
-        train_mask = (~x_all.isna().any(axis=1)) & y_log.notna()
-        x_h = x_all.loc[train_mask]
-        y_h = y_log.loc[train_mask]
-        if len(x_h) < 80:
-            continue
-        mdl = make_model()
-        mdl.fit(x_h, y_h)
-        models[h] = mdl
-    return models, feature_cols, x_latest.iloc[0]
+    y_log = np.log1p(df_train[target].shift(-1))
+    train_mask = (~x_all.isna().any(axis=1)) & y_log.notna()
+    x_h = x_all.loc[train_mask]
+    y_h = y_log.loc[train_mask]
+
+    fallback_pred = float(df_train[target].tail(min(30, len(df_train))).median())
+    if len(x_h) < 20:
+        print(
+            f"Warning: limited clean rows for {target} ({len(x_h)}). "
+            "Using recent-median fallback forecast."
+        )
+        return None, feature_cols, x_latest.iloc[0], max(0.0, fallback_pred)
+
+    mdl = make_model()
+    mdl.fit(x_h, y_h)
+    return mdl, feature_cols, x_latest.iloc[0], max(0.0, fallback_pred)
 
 
 def forecast_direct(
@@ -334,20 +395,19 @@ def forecast_direct(
     exogenous_cols: list[str],
     steps: int,
 ) -> pd.DataFrame:
-    horizons = list(range(1, steps + 1))
-    models, _, latest_x = train_direct_models(train_df, target, exogenous_cols, horizons)
+    mdl, _, latest_x, fallback_pred = train_single_model(train_df, target, exogenous_cols)
 
     last_ts = train_df["timestamp"].iloc[-1]
+    if mdl is None:
+        pred_base = fallback_pred
+    else:
+        y_log = float(mdl.predict(latest_x.to_frame().T)[0])
+        pred_base = max(0.0, float(np.expm1(y_log)))
+
     out = []
-    for h in horizons:
+    for h in range(1, steps + 1):
         ts = last_ts + pd.Timedelta(minutes=h)
-        mdl = models.get(h)
-        if mdl is None:
-            pred = np.nan
-        else:
-            y_log = float(mdl.predict(latest_x.to_frame().T)[0])
-            pred = max(0.0, float(np.expm1(y_log)))
-        out.append({"timestamp": ts, "predicted": pred})
+        out.append({"timestamp": ts, "predicted": pred_base})
     return pd.DataFrame(out)
 
 
@@ -448,7 +508,13 @@ def plot_scope_chart(
     ax.grid(True, alpha=0.3)
     plt.tight_layout()
 
-    safe_scope = scope.replace(".", "_").replace("/", "_")
+    safe_scope = (
+        scope.replace(".", "_")
+        .replace("/", "_")
+        .replace("|", "_")
+        .replace(":", "_")
+        .replace(" ", "_")
+    )
     out_path = OUTPUT_DIR / f"net_to_iops_{safe_scope}.png"
     fig.savefig(out_path, dpi=150)
     plt.close(fig)
@@ -458,20 +524,42 @@ def plot_scope_chart(
 # ------------------------------------------------------------------
 # RUN PER SCOPE
 # ------------------------------------------------------------------
-scopes = ip_list + ["OVERALL"]
-print(f"\nRunning direct-horizon Network -> IOPS for scopes: {scopes}\n")
+scopes = ip_list + (["OVERALL"] if len(ip_list) > 1 else [])
+print(f"\nRunning Network -> IOPS for scopes: {scopes}\n")
 
 for scope in scopes:
     scope_df = all_data[all_data["ip"] == scope].sort_values("timestamp").reset_index(drop=True)
 
-    if len(scope_df) < (24 + show_forecast_min + 5):
-        print(f"[{scope}] Not enough rows ({len(scope_df)}), skipping.")
-        continue
+    if MODE == "1":
+        train_start_utc = pd.Timestamp(
+            datetime.strptime(train_start_str, "%Y-%m-%d").replace(tzinfo=IST)
+        ).tz_convert("UTC")
+        train_end_utc = pd.Timestamp(
+            datetime.strptime(train_end_str, "%Y-%m-%d").replace(tzinfo=IST)
+        ).tz_convert("UTC") + pd.Timedelta(days=1)
+        forecast_date_utc = pd.Timestamp(
+            datetime.strptime(forecast_date_str, "%Y-%m-%d").replace(tzinfo=IST)
+        ).tz_convert("UTC")
+        forecast_date_end = forecast_date_utc + pd.Timedelta(days=1)
 
-    comparison_steps = show_forecast_min
-    split_idx = len(scope_df) - comparison_steps
-    train_df = scope_df.iloc[:split_idx].copy().reset_index(drop=True)
-    holdout_df = scope_df.iloc[split_idx:].copy().reset_index(drop=True)
+        train_df = scope_df[
+            (scope_df["timestamp"] >= train_start_utc) & (scope_df["timestamp"] < train_end_utc)
+        ].copy().reset_index(drop=True)
+        holdout_df = scope_df[
+            (scope_df["timestamp"] >= forecast_date_utc) & (scope_df["timestamp"] < forecast_date_end)
+        ].copy().reset_index(drop=True)
+        comparison_steps = max(len(holdout_df), 1)
+        chart_label = f"Forecast for {forecast_date_str}"
+    else:
+        train_cutoff_ts = pd.Timestamp(datetime_to_ms(train_end_str), unit="ms", tz="UTC")
+        train_df = scope_df[scope_df["timestamp"] <= train_cutoff_ts].copy().reset_index(drop=True)
+        holdout_df = scope_df[scope_df["timestamp"] > train_cutoff_ts].head(show_forecast_min).copy().reset_index(drop=True)
+        comparison_steps = show_forecast_min
+        chart_label = f"Forecast - next {comparison_steps} min"
+
+    if len(train_df) < 30:
+        print(f"[{scope}] Not enough training rows ({len(train_df)}), skipping.")
+        continue
 
     iops_exog = [
         "read_iops", "write_iops",
@@ -479,7 +567,7 @@ for scope in scopes:
         "cpu_percent", "ram_percent", "cpu_load_total", "cpu_load_1", "cpu_load_5",
     ]
 
-    print(f"[{scope}] Training direct-horizon READ IOPS models ...")
+    print(f"[{scope}] Training READ IOPS model ...")
     read_fcast = forecast_direct(
         train_df,
         target="read_iops",
@@ -487,7 +575,7 @@ for scope in scopes:
         steps=comparison_steps,
     )
 
-    print(f"[{scope}] Training direct-horizon WRITE IOPS models ...")
+    print(f"[{scope}] Training WRITE IOPS model ...")
     write_fcast = forecast_direct(
         train_df,
         target="write_iops",
@@ -495,25 +583,22 @@ for scope in scopes:
         steps=comparison_steps,
     )
 
-    # Sum component forecasts to get total IOPS forecast.
-    iops_fcast = read_fcast.copy()
-    iops_fcast = iops_fcast.rename(columns={"predicted": "pred_read"})
-    iops_fcast = iops_fcast.merge(
-        write_fcast.rename(columns={"predicted": "pred_write"}),
-        on="timestamp",
-        how="inner",
+    iops_fcast = read_fcast.rename(columns={"predicted": "pred_read"}).merge(
+        write_fcast.rename(columns={"predicted": "pred_write"}), on="timestamp", how="inner"
     )
     iops_fcast["predicted"] = iops_fcast["pred_read"].fillna(0.0) + iops_fcast["pred_write"].fillna(0.0)
     iops_fcast = iops_fcast[["timestamp", "predicted"]]
 
     compare_df = align_actual_vs_forecast(iops_fcast, holdout_df, "total_iops")
-    mae, mape, matched = mae_mape(compare_df.head(show_forecast_min))
+    mae, mape, matched = mae_mape(compare_df.head(comparison_steps))
     if matched > 0:
         mape_txt = f"{mape:.2f}%" if mape is not None else "NA"
-        print(f"[{scope}] Holdout metrics: MAE={mae:.3f}  MAPE={mape_txt}  matched={matched}/{show_forecast_min}")
+        print(f"[{scope}] Holdout metrics: MAE={mae:.3f}  MAPE={mape_txt}  matched={matched}/{comparison_steps}")
     else:
         print(f"[{scope}] Holdout metrics: no matched actual points")
 
-    plot_scope_chart(scope, train_df, compare_df, smooth_window=iops_smooth_window)
+    # Update label used by chart legend horizon text.
+    show_forecast_min = comparison_steps
+    plot_scope_chart(f"{scope} | {chart_label}", train_df, compare_df, smooth_window=iops_smooth_window)
 
 print(f"\nDone! All charts saved to: {OUTPUT_DIR.resolve()}")
