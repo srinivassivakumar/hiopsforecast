@@ -12,6 +12,7 @@ Then: fetches data → trains LightGBM → plots 2 graphs (IOPS + Network)
 from __future__ import annotations
 
 import sys
+import time
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Optional
@@ -27,7 +28,7 @@ import matplotlib.dates as mdates
 # ──────────────────────────────────────────────
 # CONSTANTS  (edit these if they ever change)
 # ──────────────────────────────────────────────
-API_BASE = "https://dev-admin-console.zybisys.com/api/admin-api/vm-performance"
+API_BASE = "https://staging-admin-console.zybisys.com/api/admin-api/vm-performance"
 SECRET_KEY = "A0tziuB02IrdIS"
 OUTPUT_DIR = Path("outputs/charts")
 IST = timezone(timedelta(hours=5, minutes=30))
@@ -92,12 +93,19 @@ def datetime_to_ms(dt_str: str) -> int:
     return int(dt.replace(tzinfo=IST).astimezone(timezone.utc).timestamp() * 1000)
 
 
-if MODE == "1":
-    from_ms = date_to_ms(train_start_str, end_of_day=False)
-    to_ms   = date_to_ms(forecast_date_str, end_of_day=True)
-else:
-    from_ms = datetime_to_ms(train_start_str)
-    to_ms   = datetime_to_ms(train_end_str) + show_forecast_min * 60 * 1000
+try:
+    if MODE == "1":
+        from_ms = date_to_ms(train_start_str, end_of_day=False)
+        to_ms   = date_to_ms(forecast_date_str, end_of_day=True)
+    else:
+        from_ms = datetime_to_ms(train_start_str)
+        to_ms   = datetime_to_ms(train_end_str) + show_forecast_min * 60 * 1000
+except ValueError:
+    if MODE == "1":
+        print("\nERROR: Invalid date format. Use YYYY-MM-DD (example: 2026-04-15).")
+    else:
+        print("\nERROR: Invalid date/time format. Use YYYY-MM-DD HH:MM (example: 2026-04-15 14:30).")
+    sys.exit(1)
 
 url = f"{API_BASE}/{ip}?from={from_ms}&to={to_ms}"
 print(f"\nFetching: {url}")
@@ -123,21 +131,46 @@ def dig(obj, path: str, default=None):
 
 headers = {"X-SECRET-KEY": SECRET_KEY}
 
+RETRYABLE_STATUSES = {502, 503, 504}
+MAX_FETCH_RETRIES = 4
+
 def _fetch_chunk(ip: str, from_ms: int, to_ms: int, timeout: int = 90) -> list:
     req_url = f"{API_BASE}/{ip}?from={from_ms}&to={to_ms}"
-    try:
-        resp = requests.get(req_url, headers=headers, timeout=timeout)
-        if resp.status_code == 404:
-            # API sometimes has sparse history windows; treat them as empty chunks.
-            return []
-        resp.raise_for_status()
-        payload = resp.json()
-    except Exception as e:
-        raise RuntimeError(f"fetch failed: {e}") from e
-    return payload.get("performance_metrics", [])
+    last_err: Exception | None = None
+    for attempt in range(1, MAX_FETCH_RETRIES + 1):
+        try:
+            resp = requests.get(req_url, headers=headers, timeout=timeout)
+            if resp.status_code == 404:
+                # API sometimes has sparse history windows; treat them as empty chunks.
+                return []
+            if resp.status_code in RETRYABLE_STATUSES and attempt < MAX_FETCH_RETRIES:
+                wait_s = 2 ** (attempt - 1)
+                print(
+                    f"    transient HTTP {resp.status_code}; retry {attempt}/{MAX_FETCH_RETRIES - 1} in {wait_s}s",
+                    flush=True,
+                )
+                time.sleep(wait_s)
+                continue
+            resp.raise_for_status()
+            payload = resp.json()
+            return payload.get("performance_metrics", [])
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+            last_err = e
+            if attempt >= MAX_FETCH_RETRIES:
+                break
+            wait_s = 2 ** (attempt - 1)
+            print(
+                f"    transient network error ({type(e).__name__}); retry {attempt}/{MAX_FETCH_RETRIES - 1} in {wait_s}s",
+                flush=True,
+            )
+            time.sleep(wait_s)
+        except Exception as e:
+            last_err = e
+            break
+    raise RuntimeError(f"fetch failed: {last_err}") from last_err
 
 
-CHUNK_DAYS = 7  # split large ranges into 7-day windows
+CHUNK_DAYS = 3  # smaller chunks reduce timeout risk on staging
 
 
 def fetch_vm_data(ip: str, from_ms: int, to_ms: int, timeout: int = 180) -> pd.DataFrame:
@@ -319,7 +352,7 @@ def build_design_matrix(df: pd.DataFrame, target: str, exogenous_cols: list[str]
     return x
 
 # ──────────────────────────────────────────────
-# 5. TRAIN DIRECT-HORIZON MODELS
+# 5. TRAIN ONE-STEP MODEL + RECURSIVE FORECAST
 # ──────────────────────────────────────────────
 
 try:
@@ -351,20 +384,15 @@ def train_single_model(
     df_train: pd.DataFrame,
     target: str,
     exogenous_cols: list[str],
-) -> tuple[Optional[object], list[str], pd.Series, float]:
-    """Train one shared LightGBM model (h=1 target) used for all forecast horizons.
-    Training a single model instead of one per horizon makes training O(1) regardless
-    of how many forecast steps are requested."""
+) -> tuple[Optional[object], list[str], pd.Series, pd.Series, float]:
+    """Train a one-step model and return training feature bounds for recursive inference."""
     x_frame = build_design_matrix(df_train, target, exogenous_cols)
     feature_cols = [c for c in x_frame.columns if c != "timestamp"]
     x_all = x_frame[feature_cols]
 
-    # Clip the latest-x row to training feature range to prevent spike blowout
     feat_lo = x_all.quantile(0.02)
     feat_hi = x_all.quantile(0.98)
-    x_latest = x_all.iloc[[-1]].copy().clip(lower=feat_lo, upper=feat_hi, axis=1)
 
-    # Single model trained on 1-step-ahead target
     y_log = np.log1p(df_train[target].shift(-1))
     train_mask = (~x_all.isna().any(axis=1)) & y_log.notna()
     x_h = x_all.loc[train_mask]
@@ -375,33 +403,78 @@ def train_single_model(
             f"Warning: limited clean rows for {target} ({len(x_h)}). "
             "Using recent-median fallback forecast."
         )
-        return None, feature_cols, x_latest.iloc[0], max(0.0, fallback_pred)
+        return None, feature_cols, feat_lo, feat_hi, max(0.0, fallback_pred)
     mdl = make_model()
     mdl.fit(x_h, y_h)
-    return mdl, feature_cols, x_latest.iloc[0], max(0.0, fallback_pred)
+    return mdl, feature_cols, feat_lo, feat_hi, max(0.0, fallback_pred)
 
 
-def forecast_direct(
+def forecast_recursive(
     train_df: pd.DataFrame,
     target: str,
     exogenous_cols: list[str],
     steps: int,
+    future_exog: Optional[pd.DataFrame] = None,
 ) -> pd.DataFrame:
-    """Forecast `steps` minutes ahead using a single shared model."""
-    mdl, _, latest_x, fallback_pred = train_single_model(train_df, target, exogenous_cols)
+    """Forecast `steps` minutes ahead by rolling one-step predictions forward."""
+    mdl, feature_cols, feat_lo, feat_hi, fallback_pred = train_single_model(
+        train_df, target, exogenous_cols
+    )
 
-    last_ts = train_df["timestamp"].iloc[-1]
-    if mdl is None:
-        pred_base = fallback_pred
-    else:
-        y_log = float(mdl.predict(latest_x.to_frame().T)[0])
-        pred_base = max(0.0, float(np.expm1(y_log)))
+    history = train_df.copy().reset_index(drop=True)
+    future_exog_lookup = None
+    if future_exog is not None and not future_exog.empty:
+        future_exog_lookup = future_exog.copy()
+        future_exog_lookup = future_exog_lookup.set_index("timestamp")
 
     out = []
     for h in range(1, steps + 1):
-        ts = last_ts + pd.Timedelta(minutes=h)
-        out.append({"timestamp": ts, "predicted": pred_base})
+        next_ts = history["timestamp"].iloc[-1] + pd.Timedelta(minutes=1)
+
+        next_row = history.iloc[[-1]].copy()
+        next_row.loc[:, "timestamp"] = next_ts
+        next_row.loc[:, target] = np.nan
+        if future_exog_lookup is not None and next_ts in future_exog_lookup.index:
+            future_vals = future_exog_lookup.loc[next_ts]
+            for col in exogenous_cols:
+                if col in future_vals.index:
+                    next_row.loc[:, col] = future_vals[col]
+
+        history_for_features = pd.concat([history, next_row], ignore_index=True)
+        x_frame = build_design_matrix(history_for_features, target, exogenous_cols)
+        latest_x = x_frame[feature_cols].iloc[[-1]].copy().clip(
+            lower=feat_lo,
+            upper=feat_hi,
+            axis=1,
+        )
+
+        if mdl is None or latest_x.isna().any().any():
+            pred_value = fallback_pred
+        else:
+            y_log = float(mdl.predict(latest_x)[0])
+            pred_value = max(0.0, float(np.expm1(y_log)))
+
+        history_for_features.loc[history_for_features.index[-1], target] = pred_value
+        history = history_for_features
+        out.append({"timestamp": next_ts, "predicted": pred_value})
     return pd.DataFrame(out)
+
+
+def forecast_future_exogenous(train_df: pd.DataFrame, steps: int) -> pd.DataFrame:
+    # Instead of forecasting, repeat the last known values for exogenous stability
+    last_row = train_df.iloc[-1][[
+        "total_network", "cpu_percent", "ram_percent", "cpu_load_total", "cpu_load_1", "cpu_load_5"
+    ]].to_dict()
+    future_timestamps = pd.date_range(
+        start=train_df["timestamp"].iloc[-1] + pd.Timedelta(minutes=1),
+        periods=steps,
+        freq="min"
+    )
+    future = pd.DataFrame({
+        "timestamp": future_timestamps,
+        **{k: [last_row[k]] * steps for k in last_row}
+    })
+    return future
 
 
 if MODE == "1":
@@ -432,27 +505,24 @@ else:
     chart_label = f"Forecast — next {show_forecast_min} min"
 
 print("Training IOPS model ...")
+future_exog = forecast_future_exogenous(train_df, show_forecast_min)
 iops_exog = [
-    "read_iops", "write_iops",
-    "in_bandwidth", "out_bandwidth", "total_network",
-    "cpu_percent", "ram_percent", "cpu_load_total", "cpu_load_1", "cpu_load_5",
+    # "total_network",
+    # "cpu_percent", "ram_percent", "cpu_load_total", "cpu_load_1", "cpu_load_5",
 ]
-iops_fcast = forecast_direct(
+iops_fcast = forecast_recursive(
     train_df,
     target="total_iops",
     exogenous_cols=iops_exog,
     steps=show_forecast_min,
+    future_exog=future_exog,
 )
 
 print("Training Network model ...")
-net_exog = [
-    "in_bandwidth", "out_bandwidth",
-    "cpu_percent", "ram_percent", "cpu_load_total", "cpu_load_1", "cpu_load_5",
-]
-net_fcast = forecast_direct(
+net_fcast = forecast_recursive(
     train_df,
     target="total_network",
-    exogenous_cols=net_exog,
+    exogenous_cols=[],
     steps=show_forecast_min,
 )
 
